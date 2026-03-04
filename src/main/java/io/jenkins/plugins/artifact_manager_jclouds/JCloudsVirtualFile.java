@@ -24,8 +24,6 @@
 
 package io.jenkins.plugins.artifact_manager_jclouds;
 
-import static org.jclouds.blobstore.options.ListContainerOptions.Builder.*;
-
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
@@ -41,16 +39,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.logging.Level;
 import java.util.logging.Logger;
-import java.util.stream.StreamSupport;
 
-import org.jclouds.blobstore.BlobStore;
 import org.jclouds.blobstore.BlobStoreContext;
-import org.jclouds.blobstore.BlobStores;
 import org.jclouds.blobstore.domain.Blob;
 import org.jclouds.blobstore.domain.MutableBlobMetadata;
-import org.jclouds.blobstore.domain.StorageMetadata;
-import org.jclouds.blobstore.options.ListContainerOptions;
-import org.jclouds.rest.AuthorizationException;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
 
@@ -58,10 +50,12 @@ import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 
-import hudson.AbortException;
 import hudson.remoting.Callable;
 import io.jenkins.plugins.artifact_manager_jclouds.BlobStoreProvider.HttpMethod;
 import jenkins.util.VirtualFile;
+import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
+import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
+import software.amazon.awssdk.services.s3.model.ObjectIdentifier;
 
 /**
  * <a href="https://jclouds.apache.org/start/blobstore/">JClouds BlobStore Guide</a>
@@ -112,17 +106,6 @@ public class JCloudsVirtualFile extends VirtualFile {
         return context;
     }
 
-    private String getContainer() {
-        return container;
-    }
-
-    /**
-     * Returns the full name, directories included
-     */
-    private String getKey() {
-        return key;
-    }
-
     /**
      * Returns the base name
      */
@@ -134,11 +117,14 @@ public class JCloudsVirtualFile extends VirtualFile {
     private Blob getBlob() throws IOException {
         if (blob == null) {
             LOGGER.log(Level.FINE, "checking for existence of blob {0} / {1}", new Object[] {container, key});
-            blob = getContext().getBlobStore().getBlob(getContainer(), getKey());
-            if (blob == null) {
-                blob = getContext().getBlobStore().blobBuilder(getKey()).build();
-                blob.getMetadata().setContainer(getContainer());
-            }
+            try {
+                HeadObjectResponse object = provider.head(container, key);
+                blob = getContext().getBlobStore().blobBuilder(key).build();
+                MutableBlobMetadata metadata = getBlob().getMetadata();
+                metadata.setContainer(container);
+                metadata.setSize(object.contentLength());
+                metadata.setLastModified(Date.from(object.lastModified()));
+            } catch (NoSuchKeyException ignored) { }
         }
         return blob;
     }
@@ -169,7 +155,7 @@ public class JCloudsVirtualFile extends VirtualFile {
             return frame.children.keySet().stream().anyMatch(f -> f.startsWith(relSlash));
         }
         LOGGER.log(Level.FINE, "checking directory status {0} / {1}", new Object[] {container, key});
-        return !getContext().getBlobStore().list(getContainer(), prefix(key + "/")).isEmpty();
+        return !provider.listAll(container, key + "/").isEmpty();
     }
 
     @Override
@@ -190,20 +176,6 @@ public class JCloudsVirtualFile extends VirtualFile {
         return isDirectory() || isFile();
     }
 
-    /**
-     * List all the blobs under this one
-     *
-     * @return some blobs
-     * @throws RuntimeException either now or when the stream is processed; wrap in {@link IOException} if desired
-     */
-    private Iterable<StorageMetadata> listStorageMetadata(boolean recursive) throws IOException {
-        ListContainerOptions options = prefix(key + "/");
-        if (recursive) {
-            options.recursive();
-        }
-        return BlobStores.listAll(getContext().getBlobStore(), getContainer(), options);
-    }
-
     @Override
     public VirtualFile[] list() throws IOException {
         String keyS = key + "/";
@@ -220,14 +192,13 @@ public class JCloudsVirtualFile extends VirtualFile {
         }
         VirtualFile[] list;
         try {
-            list = StreamSupport.stream(listStorageMetadata(false).spliterator(), false)
-                .map(meta -> new JCloudsVirtualFile(this, meta.getName().replaceFirst("/$", "")))
-                .toArray(VirtualFile[]::new);
+            list = provider.listAll(provider.getContainer(), key).stream().map(meta -> new JCloudsVirtualFile(this, meta.key().replaceFirst("/$", "")))
+              .toArray(VirtualFile[]::new);
         } catch (RuntimeException x) {
             throw new IOException(x);
         }
         LOGGER.log(Level.FINEST, "Listing files from {0} {1}: {2}",
-                new String[] { getContainer(), getKey(), Arrays.toString(list) });
+                new String[] { container, key, Arrays.toString(list) });
         return list;
     }
 
@@ -275,13 +246,13 @@ public class JCloudsVirtualFile extends VirtualFile {
         LOGGER.log(Level.FINE, "reading {0} / {1}", new Object[] {container, key});
         if (isDirectory()) {
             // That is what java.io.FileInputStream.open throws
-            throw new FileNotFoundException(String.format("%s/%s (Is a directory)", getContainer(), getKey()));
+            throw new FileNotFoundException(String.format("%s/%s (Is a directory)", container, key));
         }
         if (!isFile()) {
             throw new FileNotFoundException(
-                    String.format("%s/%s (No such file or directory)", getContainer(), getKey()));
+                    String.format("%s/%s (No such file or directory)", container, key));
         }
-        return getBlob().getPayload().openStream();
+        return provider.get(container, key);
     }
 
     /**
@@ -323,19 +294,12 @@ public class JCloudsVirtualFile extends VirtualFile {
         Deque<CacheFrame> stack = cacheFrames();
         Map<String, CachedMetadata> saved = new HashMap<>();
         int prefixLength = key.length() + /* / */1;
-        try {
-            for (StorageMetadata sm : listStorageMetadata(true)) {
-                Long length = sm.getSize();
-                if (length != null) {
-                    Date lastModified = sm.getLastModified();
-                    saved.put(sm.getName().substring(prefixLength), new CachedMetadata(length, lastModified != null ? lastModified.getTime() : 0));
-                }
+        for (ObjectIdentifier sm : provider.listAll(provider.getContainer(), key)) {
+            Long length = sm.size();
+            if (length != null) {
+                Date lastModified = Date.from(sm.lastModifiedTime());
+                saved.put(sm.key().substring(prefixLength), new CachedMetadata(length, lastModified.getTime()));
             }
-        } catch (AuthorizationException e) {
-            String cause = e.getCause() != null ? e.getCause().getMessage() : "";
-            throw new AbortException(String.format("Authorization failed: %s %s", e.getMessage(), cause));
-        } catch (RuntimeException x) {
-            throw new IOException(x);
         }
         stack.push(new CacheFrame(key + "/", saved));
         try {
@@ -359,23 +323,23 @@ public class JCloudsVirtualFile extends VirtualFile {
     /**
      * Delete all blobs starting with a given prefix.
      */
-    public static boolean delete(BlobStoreProvider provider, BlobStore blobStore, String prefix) throws IOException, InterruptedException {
+    public static boolean delete(BlobStoreProvider provider, String prefix) throws IOException, InterruptedException {
         try {
-            List<String> paths = new ArrayList<>();
-            for (StorageMetadata sm : BlobStores.listAll(blobStore, provider.getContainer(), ListContainerOptions.Builder.prefix(prefix).recursive())) {
-                String path = sm.getName();
+            List<ObjectIdentifier> identifiers = new ArrayList<>();
+            for (ObjectIdentifier sm : provider.listAll(provider.getContainer(), prefix)) {
+                String path = sm.key();
                 if (!path.startsWith(prefix)) {
                     LOGGER.warning(() -> path + " does not start with " + prefix);
                     continue;
                 }
-                paths.add(path);
+                identifiers.add(sm);
             }
-            if (paths.isEmpty()) {
+            if (identifiers.isEmpty()) {
                 LOGGER.log(Level.FINE, "nothing to delete under {0}", prefix);
                 return false;
             } else {
-                LOGGER.log(Level.FINE, "deleting {0} blobs under {1}", new Object[] {paths.size(), prefix});
-                blobStore.removeBlobs(provider.getContainer(), paths);
+                LOGGER.log(Level.FINE, "deleting {0} blobs under {1}", new Object[] {identifiers.size(), prefix});
+                provider.delete(provider.getContainer(), identifiers);
                 return true;
             }
         } catch (RuntimeException x) {

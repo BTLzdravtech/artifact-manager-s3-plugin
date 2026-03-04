@@ -54,6 +54,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -63,14 +64,11 @@ import jenkins.util.VirtualFile;
 import org.apache.http.client.methods.HttpGet;
 import org.jclouds.blobstore.BlobStore;
 import org.jclouds.blobstore.BlobStoreContext;
-import org.jclouds.blobstore.BlobStores;
 import org.jclouds.blobstore.domain.Blob;
-import org.jclouds.blobstore.domain.StorageMetadata;
-import org.jclouds.blobstore.options.CopyOptions;
-import org.jclouds.blobstore.options.ListContainerOptions;
 import org.jenkinsci.plugins.workflow.flow.StashManager;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
+import software.amazon.awssdk.services.s3.model.ObjectIdentifier;
 
 import static io.jenkins.plugins.artifact_manager_jclouds.TikaUtil.detectByTika;
 
@@ -199,7 +197,7 @@ public final class JCloudsArtifactManager extends ArtifactManager implements Sta
             LOGGER.log(Level.FINE, "Ignoring blob deletion: {0}", blobPath);
             return false;
         }
-        return JCloudsVirtualFile.delete(provider, getContext().getBlobStore(), blobPath);
+        return JCloudsVirtualFile.delete(provider, blobPath);
     }
 
     @Override
@@ -281,15 +279,14 @@ public final class JCloudsArtifactManager extends ArtifactManager implements Sta
         BlobStore blobStore = getContext().getBlobStore();
 
         // Map stash to url for download
-        String blobPath = getBlobPath("stashes/" + name + ".tgz");
-        Blob blob = blobStore.getBlob(provider.getContainer(), blobPath);
-        if (blob == null) {
-            throw new AbortException(
-                    String.format("No such saved stash ‘%s’ found at %s/%s", name, provider.getContainer(), blobPath));
-        }
+        String path = getBlobPath("stashes/" + name + ".tgz");
+        Blob blob = blobStore.blobBuilder(path).build();
+        blob.getMetadata().setContainer(provider.getContainer());
+        // We don't care about content-type when unstashing files
+        blob.getMetadata().getContentMetadata().setContentType(null);
         URL url = provider.toExternalURL(blob, HttpMethod.GET);
         workspace.act(new Unstash(url, listener));
-        listener.getLogger().printf("Unstashed file(s) from %s%n", provider.toURI(provider.getContainer(), blobPath));
+        listener.getLogger().printf("Unstashed file(s) from %s%n", provider.toURI(provider.getContainer(), path));
     }
 
     private static final class Unstash extends MasterToSlaveFileCallable<Void> {
@@ -328,20 +325,10 @@ public final class JCloudsArtifactManager extends ArtifactManager implements Sta
             return;
         }
 
-        BlobStore blobStore = getContext().getBlobStore();
-        int count = 0;
-        try {
-            for (StorageMetadata sm : BlobStores.listAll(blobStore, provider.getContainer(), ListContainerOptions.Builder.prefix(stashPrefix).recursive())) {
-                String path = sm.getName();
-                assert path.startsWith(stashPrefix);
-                LOGGER.fine("deleting " + path);
-                blobStore.removeBlob(provider.getContainer(), path);
-                count++;
-            }
-        } catch (RuntimeException x) {
-            throw new IOException(x);
-        }
-        listener.getLogger().printf("Deleted %d stash(es) from %s%n", count, provider.toURI(provider.getContainer(), stashPrefix));
+        List<ObjectIdentifier> identifiers = provider.listAll(provider.getContainer(), stashPrefix);
+        provider.delete(provider.getContainer(), identifiers);
+
+        listener.getLogger().printf("Deleted %d stash(es) from %s%n", identifiers.size(), provider.toURI(provider.getContainer(), stashPrefix));
     }
 
     @Override
@@ -355,12 +342,12 @@ public final class JCloudsArtifactManager extends ArtifactManager implements Sta
         BlobStore blobStore = getContext().getBlobStore();
         int count = 0;
         try {
-            for (StorageMetadata sm : BlobStores.listAll(blobStore, provider.getContainer(), ListContainerOptions.Builder.prefix(allPrefix).recursive())) {
-                String path = sm.getName();
+            for (ObjectIdentifier sm : provider.listAll(provider.getContainer(), allPrefix)) {
+                String path = sm.key();
                 assert path.startsWith(allPrefix);
                 String destPath = getBlobPath(dest.key, path.substring(allPrefix.length()));
                 LOGGER.fine("copying " + path + " to " + destPath);
-                blobStore.copyBlob(provider.getContainer(), path, provider.getContainer(), destPath, CopyOptions.NONE);
+                provider.copy(provider.getContainer(), path, provider.getContainer(), destPath);
                 count++;
             }
         } catch (RuntimeException x) {

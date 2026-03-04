@@ -29,6 +29,7 @@ import java.io.Serializable;
 import java.net.URI;
 import java.net.URL;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import org.jclouds.blobstore.BlobStore;
@@ -40,6 +41,11 @@ import org.kohsuke.accmod.restrictions.Beta;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.ExtensionPoint;
 import hudson.model.AbstractDescribableImpl;
+import software.amazon.awssdk.core.ResponseInputStream;
+import software.amazon.awssdk.services.s3.model.CopyObjectResponse;
+import software.amazon.awssdk.services.s3.model.GetObjectResponse;
+import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
+import software.amazon.awssdk.services.s3.model.ObjectIdentifier;
 
 /**
  * Provider for jclouds-based blob stores usable for artifact storage.
@@ -96,6 +102,16 @@ public abstract class BlobStoreProvider extends AbstractDescribableImpl<BlobStor
      */
     @NonNull
     public abstract URL toExternalURL(@NonNull Blob blob, @NonNull HttpMethod httpMethod) throws IOException;
+
+    public abstract HeadObjectResponse head(String bucket, String key) throws IOException;
+
+    public abstract ResponseInputStream<GetObjectResponse> get(String bucket, String key) throws IOException;
+
+    public abstract CopyObjectResponse copy(String sourceBucket, String sourceKey, String destinationBucket, String destinationKey) throws IOException;
+
+    public abstract List<ObjectIdentifier> listAll(String bucket, String prefix) throws IOException;
+
+    public abstract void delete(String bucket, List<ObjectIdentifier> identifiers) throws IOException;
 
     @Override
     public BlobStoreProviderDescriptor getDescriptor() {

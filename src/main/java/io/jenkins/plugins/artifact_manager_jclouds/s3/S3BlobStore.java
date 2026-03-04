@@ -30,6 +30,7 @@ import java.net.URISyntaxException;
 import java.net.URL;
 import java.time.Duration;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Properties;
@@ -65,12 +66,19 @@ import io.jenkins.plugins.aws.global_configuration.CredentialsAwsGlobalConfigura
 import org.jenkinsci.Symbol;
 import software.amazon.awssdk.auth.credentials.AwsCredentials;
 import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
+import software.amazon.awssdk.core.ResponseInputStream;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3Configuration;
+import software.amazon.awssdk.services.s3.model.CopyObjectResponse;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectResponse;
 import software.amazon.awssdk.services.s3.model.GetUrlRequest;
+import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
+import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
+import software.amazon.awssdk.services.s3.model.ObjectIdentifier;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.services.s3.paginators.ListObjectsV2Iterable;
 import software.amazon.awssdk.services.s3.presigner.S3Presigner;
 import software.amazon.awssdk.services.s3.presigner.model.GetObjectPresignRequest;
 import software.amazon.awssdk.services.s3.presigner.model.PutObjectPresignRequest;
@@ -203,8 +211,7 @@ public class S3BlobStore extends BlobStoreProvider {
     @Override
     public URI toURI(@NonNull String container, @NonNull String key) {
         try (S3Client s3Client = getConfiguration().getAmazonS3ClientBuilder().build()) {
-            GetUrlRequest getUrlRequest = GetUrlRequest.builder().key(key).bucket(container).build();
-            URI uri = s3Client.utilities().getUrl(getUrlRequest).toURI();
+            URI uri = s3Client.utilities().getUrl(b -> b.bucket(container).key(key)).toURI();
             LOGGER.fine(() -> container + " / " + key + " → " + uri);
             return uri;
         } catch (URISyntaxException e) {
@@ -266,6 +273,40 @@ public class S3BlobStore extends BlobStoreProvider {
                 return presigner.presignGetObject(getObjectPresignRequest).url();
             default:
                 throw new IOException("HTTP Method " + httpMethod + " not supported for S3");
+        }
+    }
+
+    public HeadObjectResponse head(String bucket, String key) throws IOException {
+        try (S3Client s3Client = this.getConfiguration().getAmazonS3ClientBuilderWithCredentials().build()) {
+            return s3Client.headObject(builder -> builder.bucket(bucket).key(key));
+        }
+    }
+
+    public ResponseInputStream<GetObjectResponse> get(String bucket, String key) throws IOException {
+        try (S3Client s3Client = this.getConfiguration().getAmazonS3ClientBuilderWithCredentials().build()) {
+             return s3Client.getObject(builder -> builder.bucket(bucket).key(key));
+        }
+    }
+
+    public CopyObjectResponse copy(String sourceBucket, String sourceKey, String destinationBucket, String destinationKey) throws IOException {
+        try (S3Client s3Client = this.getConfiguration().getAmazonS3ClientBuilderWithCredentials().build()) {
+            return s3Client.copyObject(builder -> builder.sourceBucket(sourceBucket).sourceKey(sourceKey).destinationBucket(destinationBucket).destinationKey(destinationKey));
+        }
+    }
+
+    public List<ObjectIdentifier> listAll(String bucket, String prefix) throws IOException {
+        try (S3Client s3Client = this.getConfiguration().getAmazonS3ClientBuilderWithCredentials().build()) {
+            ListObjectsV2Request listReq = ListObjectsV2Request.builder().bucket(bucket).prefix(prefix).build();
+            ListObjectsV2Iterable listRes = s3Client.listObjectsV2Paginator(listReq);
+            return listRes.stream()
+              .flatMap(r -> r.contents().stream())
+              .map(obj -> ObjectIdentifier.builder().key(obj.key()).size(obj.size()).lastModifiedTime(obj.lastModified()).build()).toList();
+        }
+    }
+
+    public void delete(String bucket, List<ObjectIdentifier> identifiers) throws IOException {
+        try (S3Client s3Client = this.getConfiguration().getAmazonS3ClientBuilderWithCredentials().build()) {
+            identifiers.forEach(identifier -> s3Client.deleteObject(b -> b.bucket(bucket).key(identifier.key())));
         }
     }
 
